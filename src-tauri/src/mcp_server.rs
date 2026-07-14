@@ -209,21 +209,23 @@ async fn execute_tool(state: &Arc<ServerState>, workspace: &str, tool_name: &str
 }
 
 fn validate_path(workspace: &str, path: &str) -> Result<PathBuf, String> {
-    // 1. Normalize workspace: lowercase, forward slashes, strip ALL trailing slashes, add exactly one.
     let mut ws = workspace.replace('\\', "/").to_lowercase();
-    while ws.ends_with('/') {
-        ws.pop();
-    }
-    ws.push('/');
+    if !ws.ends_with('/') { ws.push('/'); }
 
-    // 2. Determine target path
-    let target = if Path::new(path).is_absolute() {
+    // Check if it's a TRUE absolute path (e.g., C:\, G:\, or \\server\)
+    let has_drive = path.len() >= 2 && path.as_bytes()[1] == b':';
+    let is_unc = path.starts_with("\\\\");
+    let is_true_absolute = has_drive || is_unc;
+
+    let target = if is_true_absolute {
         PathBuf::from(path)
     } else {
-        Path::new(workspace).join(path)
+        // Strip leading slashes/backslashes so /apps/backend becomes apps/backend
+        let clean_path = path.trim_start_matches('/').trim_start_matches('\\');
+        Path::new(workspace).join(clean_path)
     };
 
-    // 3. Resolve . and .. manually
+    // Resolve . and .. manually
     let mut resolved = PathBuf::new();
     for comp in target.components() {
         match comp {
@@ -233,10 +235,9 @@ fn validate_path(workspace: &str, path: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // 4. Normalize resolved path
+    // Security check
     let res_str = resolved.to_string_lossy().replace('\\', "/").to_lowercase();
 
-    // 5. Strict prefix check (now includes the workspace prefix in the error message for debugging)
     if !res_str.starts_with(&ws) && res_str != ws.trim_end_matches('/') {
         return Err(format!("Access denied: Path '{}' is outside workspace prefix '{}'", res_str, ws));
     }
