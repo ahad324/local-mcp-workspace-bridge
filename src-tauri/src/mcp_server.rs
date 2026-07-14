@@ -3,6 +3,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
     response::sse::{Sse, Event},
+    http::StatusCode,
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,9 +100,15 @@ impl JsonRpcResponse {
 async fn handle_mcp_request(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<JsonRpcRequest>,
-) -> Json<JsonRpcResponse> {
+) -> impl IntoResponse {
     let workspace = state.workspace.read().await.clone();
     
+    // JSON-RPC Spec: If 'id' is missing/null, it's a notification. Do not reply.
+    if req.id.is_none() {
+        add_log(&state, "INFO", &format!("Notification received: {}", req.method));
+        return StatusCode::NO_CONTENT.into_response(); // <-- FIXED
+    }
+
     add_log(&state, "REQ", &format!("Method: {} | Params: {}", req.method, serde_json::to_string(&req.params).unwrap_or_default()));
 
     let response = match req.method.as_str() {
@@ -144,7 +152,7 @@ async fn handle_mcp_request(
     let msg = if let Some(err) = &response.error { format!("Error: {}", err.message) } else { "Success".to_string() };
     add_log(&state, status, &msg);
 
-    Json(response)
+    Json(response).into_response() // <-- FIXED
 }
 
 async fn execute_tool(state: &Arc<ServerState>, workspace: &str, tool_name: &str, args: Value) -> Result<Value, String> {
