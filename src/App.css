@@ -130,3 +130,63 @@ footer {
   height: 100vh;
   font-size: 1.2rem;
 }
+
+.logs-section {
+  display: flex;
+  flex-direction: column;
+  height: 400px;
+}
+
+.logs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.logs-header h3 {
+  margin: 0;
+  color: #e0e0e0;
+}
+
+.clear-btn {
+  background: #f44336;
+  color: white;
+  border: none;
+  padding: 0.4rem 0.8rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.logs-console {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-y: auto;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 0.85rem;
+}
+
+.empty-logs {
+  color: #8b949e;
+  text-align: center;
+  margin-top: 2rem;
+}
+
+.log-entry {
+  margin-bottom: 0.4rem;
+  line-height: 1.4;
+  border-bottom: 1px solid #21262d;
+  padding-bottom: 0.2rem;
+}
+
+.log-time { color: #8b949e; margin-right: 0.5rem; }
+.log-level { font-weight: bold; margin-right: 0.5rem; min-width: 50px; display: inline-block; }
+.log-msg { color: #c9d1d9; word-break: break-all; }
+
+.log-req .log-level { color: #58a6ff; }
+.log-res .log-level { color: #3fb950; }
+.log-err .log-level { color: #f85149; }
+.log-path .log-level { color: #d2a8ff; }

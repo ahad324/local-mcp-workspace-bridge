@@ -5,7 +5,7 @@ mod mcp_server;
 mod ngrok_manager;
 mod commands;
 
-use tauri::Manager;
+use tauri::Manager; // <-- ADDED THIS
 use std::sync::Arc;
 
 fn main() {
@@ -16,14 +16,12 @@ fn main() {
             commands::start_server,
             commands::stop_server,
             commands::get_ngrok_url,
+            commands::get_logs,
         ])
         .setup(|app| {
-            // app.handle() returns AppHandle, which auto-borrows to &AppHandle
             let config = config::load_config(app.handle()).unwrap_or_default();
-            
             app.manage(std::sync::Mutex::new(config));
             app.manage(Arc::new(mcp_server::ServerState::new()));
-            
             Ok(())
         })
         .run(tauri::generate_context!())

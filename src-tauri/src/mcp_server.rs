@@ -7,18 +7,29 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::Infallible;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, watch};
 use tokio_stream::{self as stream};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use regex::Regex;
 use tower_http::cors::{Any, CorsLayer};
+use tokio::process::Child as TokioChild;
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LogEntry {
+    pub time: u128,
+    pub level: String,
+    pub message: String,
+}
 
 pub struct ServerState {
     pub is_running: RwLock<bool>,
     pub ngrok_url: RwLock<Option<String>>,
     pub workspace: RwLock<String>,
+    pub shutdown_tx: RwLock<Option<watch::Sender<bool>>>,
+    pub ngrok_child: RwLock<Option<TokioChild>>,
+    pub logs: Mutex<Vec<LogEntry>>, // Added for polling logs
 }
 
 impl ServerState {
@@ -27,7 +38,26 @@ impl ServerState {
             is_running: RwLock::new(false),
             ngrok_url: RwLock::new(None),
             workspace: RwLock::new(String::new()),
+            shutdown_tx: RwLock::new(None),
+            ngrok_child: RwLock::new(None),
+            logs: Mutex::new(Vec::new()),
         }
+    }
+}
+
+// Helper to add logs safely from anywhere
+pub fn add_log(state: &Arc<ServerState>, level: &str, message: &str) {
+    let entry = LogEntry {
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        level: level.to_string(),
+        message: message.to_string(),
+    };
+    if let Ok(mut logs) = state.logs.lock() {
+        logs.push(entry);
+        if logs.len() > 200 { logs.remove(0); } // Keep memory low
     }
 }
 
@@ -71,14 +101,16 @@ async fn handle_mcp_request(
 ) -> Json<JsonRpcResponse> {
     let workspace = state.workspace.read().await.clone();
     
-    match req.method.as_str() {
+    add_log(&state, "REQ", &format!("Method: {} | Params: {}", req.method, serde_json::to_string(&req.params).unwrap_or_default()));
+
+    let response = match req.method.as_str() {
         "initialize" => {
             let result = serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "Local Workspace Bridge", "version": "0.1.0" }
             });
-            Json(JsonRpcResponse::success(req.id, result))
+            JsonRpcResponse::success(req.id, result)
         }
         "tools/list" => {
             let tools = serde_json::json!({
@@ -90,52 +122,59 @@ async fn handle_mcp_request(
                     { "name": "delete_file", "description": "Delete a file", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } }
                 ]
             });
-            Json(JsonRpcResponse::success(req.id, tools))
+            JsonRpcResponse::success(req.id, tools)
         }
         "tools/call" => {
             if let Some(params) = req.params {
                 let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
                 
-                match execute_tool(&workspace, tool_name, arguments).await {
-                    Ok(res) => Json(JsonRpcResponse::success(req.id, res)),
-                    Err(e) => Json(JsonRpcResponse::error(req.id, -32000, e)),
+                match execute_tool(&state, &workspace, tool_name, arguments).await {
+                    Ok(res) => JsonRpcResponse::success(req.id, res),
+                    Err(e) => JsonRpcResponse::error(req.id, -32000, e.clone()),
                 }
             } else {
-                Json(JsonRpcResponse::error(req.id, -32602, "Missing params".to_string()))
+                JsonRpcResponse::error(req.id, -32602, "Missing params".to_string())
             }
         }
-        _ => Json(JsonRpcResponse::error(req.id, -32601, "Method not found".to_string())),
-    }
+        _ => JsonRpcResponse::error(req.id, -32601, "Method not found".to_string()),
+    };
+
+    let status = if response.error.is_some() { "ERR" } else { "RES" };
+    let msg = if let Some(err) = &response.error { format!("Error: {}", err.message) } else { "Success".to_string() };
+    add_log(&state, status, &msg);
+
+    Json(response)
 }
 
-async fn execute_tool(workspace: &str, tool_name: &str, args: Value) -> Result<Value, String> {
+async fn execute_tool(state: &Arc<ServerState>, workspace: &str, tool_name: &str, args: Value) -> Result<Value, String> {
     match tool_name {
         "read_file" => {
             let path = args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
+            add_log(state, "PATH", &format!("Raw: {}", path));
             let full_path = validate_path(workspace, path)?;
-            let content = tokio::fs::read_to_string(full_path).await.map_err(|e| e.to_string())?;
+            let content = tokio::fs::read_to_string(&full_path).await.map_err(|e| format!("Read failed: {}", e))?;
             Ok(serde_json::json!({ "content": [{ "type": "text", "text": content }] }))
         }
         "write_file" => {
             let path = args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
             let content = args.get("content").and_then(|c| c.as_str()).ok_or("Missing content")?;
+            add_log(state, "PATH", &format!("Raw: {}", path));
             let full_path = validate_path(workspace, path)?;
             if let Some(parent) = full_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| format!("Dir creation failed: {}", e))?;
             }
-            tokio::fs::write(full_path, content).await.map_err(|e| e.to_string())?;
+            tokio::fs::write(&full_path, content).await.map_err(|e| format!("Write failed: {}", e))?;
             Ok(serde_json::json!({ "content": [{ "type": "text", "text": "Success" }] }))
         }
         "list_files" => {
             let path = args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
+            add_log(state, "PATH", &format!("Raw: {}", path));
             let full_path = validate_path(workspace, path)?;
             let mut files = Vec::new();
             for entry in WalkDir::new(&full_path).max_depth(2).into_iter().filter_map(|e| e.ok()) {
                 if let Ok(rel) = entry.path().strip_prefix(&full_path) {
-                    if !rel.as_os_str().is_empty() {
-                        files.push(rel.to_string_lossy().to_string());
-                    }
+                    if !rel.as_os_str().is_empty() { files.push(rel.to_string_lossy().to_string()); }
                 }
             }
             Ok(serde_json::json!({ "content": [{ "type": "text", "text": files.join("\n") }] }))
@@ -143,17 +182,15 @@ async fn execute_tool(workspace: &str, tool_name: &str, args: Value) -> Result<V
         "search_files" => {
             let path = args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
             let query = args.get("query").and_then(|q| q.as_str()).ok_or("Missing query")?;
+            add_log(state, "PATH", &format!("Raw: {} | Query: {}", path, query));
             let full_path = validate_path(workspace, path)?;
             let regex = Regex::new(query).map_err(|e| e.to_string())?;
             let mut matches = Vec::new();
-            
             for entry in WalkDir::new(&full_path).into_iter().filter_map(|e| e.ok()) {
                 if entry.file_type().is_file() {
                     if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
                         for (i, line) in content.lines().enumerate() {
-                            if regex.is_match(line) {
-                                matches.push(format!("{}:{}:{}", entry.path().display(), i + 1, line));
-                            }
+                            if regex.is_match(line) { matches.push(format!("{}:{}:{}", entry.path().display(), i + 1, line)); }
                         }
                     }
                 }
@@ -162,46 +199,46 @@ async fn execute_tool(workspace: &str, tool_name: &str, args: Value) -> Result<V
         }
         "delete_file" => {
             let path = args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
+            add_log(state, "PATH", &format!("Raw: {}", path));
             let full_path = validate_path(workspace, path)?;
-            tokio::fs::remove_file(full_path).await.map_err(|e| e.to_string())?;
+            tokio::fs::remove_file(&full_path).await.map_err(|e| format!("Delete failed: {}", e))?;
             Ok(serde_json::json!({ "content": [{ "type": "text", "text": "Deleted" }] }))
         }
         _ => Err("Unknown tool".to_string()),
     }
 }
 
-// BULLETPROOF PATH VALIDATION
 fn validate_path(workspace: &str, path: &str) -> Result<PathBuf, String> {
-    let workspace_path = Path::new(workspace);
-    
-    // 1. Normalize workspace to ensure it ends with a separator for prefix checking
-    let mut ws_str = workspace_path.to_string_lossy().to_string();
-    if !ws_str.ends_with('\\') && !ws_str.ends_with('/') {
-        ws_str.push('\\');
+    // 1. Normalize workspace: lowercase, forward slashes, strip ALL trailing slashes, add exactly one.
+    let mut ws = workspace.replace('\\', "/").to_lowercase();
+    while ws.ends_with('/') {
+        ws.pop();
     }
-    let ws_lower = ws_str.to_lowercase();
+    ws.push('/');
 
-    // 2. Determine target path (handles both absolute and relative paths from Grok)
-    let target_path = if Path::new(path).is_absolute() {
+    // 2. Determine target path
+    let target = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        workspace_path.join(path)
+        Path::new(workspace).join(path)
     };
 
-    // 3. Resolve . and .. manually so we don't need the file to exist yet
+    // 3. Resolve . and .. manually
     let mut resolved = PathBuf::new();
-    for component in target_path.components() {
-        match component {
+    for comp in target.components() {
+        match comp {
             std::path::Component::ParentDir => { resolved.pop(); }
             std::path::Component::CurDir => {}
-            _ => resolved.push(component),
+            _ => resolved.push(comp),
         }
     }
 
-    // 4. Strict prefix check to prevent directory traversal
-    let res_lower = resolved.to_string_lossy().to_lowercase();
-    if !res_lower.starts_with(&ws_lower) {
-        return Err(format!("Access denied: Path is outside workspace"));
+    // 4. Normalize resolved path
+    let res_str = resolved.to_string_lossy().replace('\\', "/").to_lowercase();
+
+    // 5. Strict prefix check (now includes the workspace prefix in the error message for debugging)
+    if !res_str.starts_with(&ws) && res_str != ws.trim_end_matches('/') {
+        return Err(format!("Access denied: Path '{}' is outside workspace prefix '{}'", res_str, ws));
     }
 
     Ok(resolved)
@@ -212,7 +249,7 @@ async fn sse_handler() -> Sse<impl stream::Stream<Item = Result<Event, Infallibl
     Sse::new(stream)
 }
 
-pub async fn start_mcp_server(state: Arc<ServerState>, port: u16) {
+pub async fn start_mcp_server(state: Arc<ServerState>, port: u16, mut shutdown_rx: watch::Receiver<bool>) {
     let app = Router::new()
         .route("/", get(sse_handler).post(handle_mcp_request))
         .route("/sse", get(sse_handler))
@@ -222,13 +259,10 @@ pub async fn start_mcp_server(state: Arc<ServerState>, port: u16) {
 
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind MCP server: {}", e);
-            return;
-        }
+        Err(e) => { eprintln!("Failed to bind MCP server: {}", e); return; }
     };
     
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(async move { let _ = shutdown_rx.changed().await; }).await {
         eprintln!("MCP server error: {}", e);
     }
 }
